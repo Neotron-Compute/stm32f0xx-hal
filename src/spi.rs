@@ -1,11 +1,13 @@
 //! API for the integrate SPI peripherals
 //!
-//! The spi bus acts as the master (generating the clock) and you need to handle the CS separately.
+//! The `Spi` struct configures the bus to acts as the bus controller (i.e. generating the clock) and you need to handle the CS separately.
+//!
+//! The `SpiP` struct configures the bus to act as a bus peripheral (i.e. some other controller on ths bus generates te clock).
 //!
 //! The most significant bit is transmitted first & only 8-bit transfers are supported
 //!
 //! # Example
-//! Echo incoming data in the next transfer
+//! Echo incoming data in the next transfer. Run as an SPI controller.
 //! ``` no_run
 //! use stm32f0xx_hal as hal;
 //!
@@ -24,7 +26,7 @@
 //!     let miso = gpioa.pa6.into_alternate_af0(cs);
 //!     let mosi = gpioa.pa7.into_alternate_af0(cs);
 //!
-//!     // Configure SPI with 1MHz rate
+//!     // Configure SPI Controller with 1 MHz rate
 //!     let mut spi = Spi::spi1(p.SPI1, (sck, miso, mosi), Mode {
 //!         polarity: Polarity::IdleHigh,
 //!         phase: Phase::CaptureOnSecondTransition,
@@ -73,6 +75,20 @@ pub struct EightBit;
 /// Typestate for 16-bit transfer size
 pub struct SixteenBit;
 
+/// Our transfer size typestates implement this.
+pub trait TransferWidth {
+    /// The data type returned if you do a read, or required if you do a write
+    type Atom;
+}
+
+impl TransferWidth for EightBit {
+    type Atom = u8;
+}
+
+impl TransferWidth for SixteenBit {
+    type Atom = u16;
+}
+
 /// SPI error
 #[derive(Debug)]
 pub enum Error {
@@ -86,11 +102,16 @@ pub enum Error {
     _Extensible,
 }
 
-/// SPI abstraction
+/// SPI abstraction for a Controller of the SPI Bus
 pub struct Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> {
     spi: SPI,
     pins: (SCKPIN, MISOPIN, MOSIPIN),
     _width: PhantomData<WIDTH>,
+}
+
+/// SPI abstraction for a Peripheral on an SPI Bus
+pub struct SpiP<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> {
+    inner: Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>,
 }
 
 pub trait SckPin<SPI> {}
@@ -211,7 +232,7 @@ macro_rules! spi {
     ($($SPI:ident: ($spi:ident, $spiXen:ident, $spiXrst:ident, $apbenr:ident, $apbrstr:ident),)+) => {
         $(
             impl<SCKPIN, MISOPIN, MOSIPIN> Spi<$SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit> {
-                /// Creates a new spi instance
+                /// Creates a new SPI controller instance
                 pub fn $spi<F>(
                     spi: $SPI,
                     pins: (SCKPIN, MISOPIN, MOSIPIN),
@@ -235,6 +256,31 @@ macro_rules! spi {
                     Spi::<$SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit> { spi, pins, _width: PhantomData }.spi_init(mode, speed, rcc.clocks).into_8bit_width()
                 }
             }
+
+            impl<SCKPIN, MISOPIN, MOSIPIN> SpiP<$SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit> {
+                /// Creates a new SPI Peripheral instance
+                pub fn $spi(
+                    spi: $SPI,
+                    pins: (SCKPIN, MISOPIN, MOSIPIN),
+                    mode: Mode,
+                    rcc: &mut Rcc,
+                ) -> Self
+                where
+                    SCKPIN: SckPin<$SPI>,
+                    MISOPIN: MisoPin<$SPI>,
+                    MOSIPIN: MosiPin<$SPI>,
+                {
+                    /* Enable clock for SPI */
+                    rcc.regs.$apbenr.modify(|_, w| w.$spiXen().set_bit());
+
+                    /* Reset SPI */
+                    rcc.regs.$apbrstr.modify(|_, w| w.$spiXrst().set_bit());
+                    rcc.regs.$apbrstr.modify(|_, w| w.$spiXrst().clear_bit());
+
+                    SpiP { inner: Spi::<$SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit> { spi, pins, _width: PhantomData } }.spi_init(mode).into_8bit_width()
+                }
+            }
+
         )+
     }
 }
@@ -267,6 +313,7 @@ type SpiRegisterBlock = crate::pac::spi1::RegisterBlock;
 impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
 where
     SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth,
 {
     fn spi_init<F>(self, mode: Mode, speed: F, clocks: Clocks) -> Self
     where
@@ -407,24 +454,14 @@ where
         })
     }
 
-    fn read_u8(&mut self) -> u8 {
+    fn read(&mut self) -> WIDTH::Atom {
         // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows reading a half-word)
-        unsafe { ptr::read_volatile(&self.spi.dr as *const _ as *const u8) }
+        unsafe { ptr::read_volatile(&self.spi.dr as *const _ as *const WIDTH::Atom) }
     }
 
-    fn send_u8(&mut self, byte: u8) {
+    fn send(&mut self, byte: WIDTH::Atom) {
         // NOTE(write_volatile) see note above
-        unsafe { ptr::write_volatile(&self.spi.dr as *const _ as *mut u8, byte) }
-    }
-
-    fn read_u16(&mut self) -> u16 {
-        // NOTE(read_volatile) read only 2 bytes (the svd2rust API only allows reading a half-word)
-        unsafe { ptr::read_volatile(&self.spi.dr as *const _ as *const u16) }
-    }
-
-    fn send_u16(&mut self, byte: u16) {
-        // NOTE(write_volatile) see note above
-        unsafe { ptr::write_volatile(&self.spi.dr as *const _ as *mut u16, byte) }
+        unsafe { ptr::write_volatile(&self.spi.dr as *const _ as *mut WIDTH::Atom, byte) }
     }
 
     pub fn release(self) -> (SPI, (SCKPIN, MISOPIN, MOSIPIN)) {
@@ -432,36 +469,90 @@ where
     }
 }
 
-impl<SPI, SCKPIN, MISOPIN, MOSIPIN> ::embedded_hal::blocking::spi::Transfer<u8>
-    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit>
+impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> SpiP<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
 where
     SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth,
+{
+    fn spi_init(self, mode: Mode) -> Self {
+        /* Make sure the SPI unit is disabled so we can configure it */
+        self.inner.spi.cr1.modify(|_, w| w.spe().clear_bit());
+
+        // mstr: false = peripheral  configuration
+        // lsbfirst: MSB first
+        // ssm: enable software CS management (NSS/CS pin free for other uses)
+        // ssi: set nss high = master mode
+        // dff: 8 bit frames
+        // bidimode: 2-line unidirectional
+        // spe: enable the SPI bus
+        self.inner.spi.cr1.write(|w| {
+            w.cpha().bit(mode.phase == Phase::CaptureOnSecondTransition);
+            w.cpol().bit(mode.polarity == Polarity::IdleHigh);
+            w.mstr().clear_bit();
+            w.lsbfirst().clear_bit();
+            w.ssm().set_bit();
+            w.ssi().set_bit();
+            w.rxonly().clear_bit();
+            w.bidimode().clear_bit();
+            w.spe().set_bit();
+            w
+        });
+
+        self
+    }
+
+    pub fn into_8bit_width(self) -> SpiP<SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit> {
+        SpiP {
+            inner: self.inner.into_8bit_width(),
+        }
+    }
+
+    pub fn into_16bit_width(self) -> SpiP<SPI, SCKPIN, MISOPIN, MOSIPIN, SixteenBit> {
+        SpiP {
+            inner: self.inner.into_16bit_width(),
+        }
+    }
+
+    pub fn release(self) -> (SPI, (SCKPIN, MISOPIN, MOSIPIN)) {
+        (self.inner.spi, self.inner.pins)
+    }
+}
+
+impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> ::embedded_hal::blocking::spi::Transfer<u8>
+    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
+where
+    SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth<Atom = u8>,
 {
     type Error = Error;
 
-    fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Self::Error> {
+    fn transfer<'w>(
+        &mut self,
+        words: &'w mut [WIDTH::Atom],
+    ) -> Result<&'w [WIDTH::Atom], Self::Error> {
         // We want to transfer bidirectionally, make sure we're in the correct mode
         self.set_bidi();
 
         for word in words.iter_mut() {
             nb::block!(self.check_send())?;
-            self.send_u8(word.clone());
+            self.send(word.clone());
             nb::block!(self.check_read())?;
-            *word = self.read_u8();
+            *word = self.read();
         }
 
         Ok(words)
     }
 }
 
-impl<SPI, SCKPIN, MISOPIN, MOSIPIN> ::embedded_hal::blocking::spi::Write<u8>
-    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, EightBit>
+impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> ::embedded_hal::blocking::spi::Write<u8>
+    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
 where
     SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth<Atom = u8>,
 {
     type Error = Error;
 
-    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+    fn write(&mut self, words: &[WIDTH::Atom]) -> Result<(), Self::Error> {
         let mut bufcap: u8 = 0;
 
         // We only want to send, so we don't need to worry about the receive buffer overflowing
@@ -477,7 +568,7 @@ where
                 bufcap = self.send_buffer_size();
             }
 
-            self.send_u8(*word);
+            self.send(*word);
             bufcap -= 1;
         }
 
@@ -487,42 +578,58 @@ where
     }
 }
 
-impl<SPI, SCKPIN, MISOPIN, MOSIPIN> ::embedded_hal::blocking::spi::Transfer<u16>
-    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, SixteenBit>
+impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> ::embedded_hal::blocking::spi::Transfer<u16>
+    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
 where
     SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth<Atom = u16>,
 {
     type Error = Error;
 
-    fn transfer<'w>(&mut self, words: &'w mut [u16]) -> Result<&'w [u16], Self::Error> {
+    fn transfer<'w>(
+        &mut self,
+        words: &'w mut [WIDTH::Atom],
+    ) -> Result<&'w [WIDTH::Atom], Self::Error> {
         // We want to transfer bidirectionally, make sure we're in the correct mode
         self.set_bidi();
 
         for word in words.iter_mut() {
             nb::block!(self.check_send())?;
-            self.send_u16(*word);
+            self.send(word.clone());
             nb::block!(self.check_read())?;
-            *word = self.read_u16();
+            *word = self.read();
         }
 
         Ok(words)
     }
 }
 
-impl<SPI, SCKPIN, MISOPIN, MOSIPIN> ::embedded_hal::blocking::spi::Write<u16>
-    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, SixteenBit>
+impl<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH> ::embedded_hal::blocking::spi::Write<u16>
+    for Spi<SPI, SCKPIN, MISOPIN, MOSIPIN, WIDTH>
 where
     SPI: Deref<Target = SpiRegisterBlock>,
+    WIDTH: TransferWidth<Atom = u16>,
 {
     type Error = Error;
 
-    fn write(&mut self, words: &[u16]) -> Result<(), Self::Error> {
+    fn write(&mut self, words: &[WIDTH::Atom]) -> Result<(), Self::Error> {
+        let mut bufcap: u8 = 0;
+
         // We only want to send, so we don't need to worry about the receive buffer overflowing
         self.set_send_only();
 
+        // Make sure we don't continue with an error condition
+        nb::block!(self.check_send())?;
+
+        // We have a 32 bit buffer to work with, so let's fill it before checking the status
         for word in words {
-            nb::block!(self.check_send())?;
-            self.send_u16(word.clone());
+            // Loop as long as our send buffer is full
+            while bufcap == 0 {
+                bufcap = self.send_buffer_size();
+            }
+
+            self.send(*word);
+            bufcap -= 1;
         }
 
         // Do one last status register check before continuing
